@@ -309,7 +309,9 @@ load_job() {
 }
 
 log() {
-    local line="[$(date -Is)] $*"
+    local line
+    line="[$(date -Is)] $*"
+
     if [ -n "${LOG_FILE:-}" ]; then
         mkdir -p "$LOG_DIR"
         if [ "$QUIET" = "1" ]; then
@@ -902,7 +904,10 @@ cmd_run() {
         else
             all_result="COMPLETED"
         fi
-        local summary="ALL JOBS $all_result | elapsed $(format_elapsed "$all_elapsed")"
+        
+        local summary
+        summary="ALL JOBS $all_result | elapsed $(format_elapsed "$all_elapsed")"
+
         if [ "${#warning_jobs[@]}" -gt 0 ]; then
             summary="$summary | warnings in: ${warning_jobs[*]}"
         fi

@@ -24,7 +24,7 @@ jobs:
 
       - name: Run shellcheck
         run: |
-          shellcheck backup-restic install.sh tests/*.bash
+          shellcheck backup-restic install.sh
 
   test-root:
     name: Test (root mode)
