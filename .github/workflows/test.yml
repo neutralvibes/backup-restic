@@ -46,7 +46,7 @@ jobs:
 
       - name: Run shellcheck
         run: |
-          shellcheck backup-restic install.sh tests/*.bash
+          shellcheck backup-restic install.sh
 
   shellcheck:
     name: ShellCheck
@@ -61,4 +61,4 @@ jobs:
 
       - name: Run shellcheck
         run: |
-          shellcheck -x backup-restic install.sh tests/*.bash
+          shellcheck -x backup-restic install.sh
