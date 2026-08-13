@@ -112,7 +112,7 @@ Installs the wrapper for all users on the system. Ideal for servers and workstat
 where backups run via `root` cron jobs.
 
 ```bash
-sudo git clone --depth 1 https://<repo-url>/backup-restic.git /usr/local/src/backup-restic
+sudo git clone --depth 1 https://github.com/neutralvibes/backup-restic.git /usr/local/src/backup-restic
 cd /usr/local/src/backup-restic
 sudo ./install.sh
 ```
@@ -133,7 +133,7 @@ Installs the wrapper entirely within your home directory. Ideal for backing up
 personal files without requiring `sudo` privileges.
 
 ```bash
-git clone --depth 1 https://<repo-url>/backup-restic.git ~/src/backup-restic
+git clone --depth 1 https://github.com/neutralvibes/backup-restic.git ~/src/backup-restic
 cd ~/src/backup-restic
 ./install.sh
 ```
