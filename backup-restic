@@ -3,7 +3,7 @@
 #
 # Requires bash >= 4.4 (relies on empty-array expansion "${arr[@]}" under `set -u`).
 set -uo pipefail
-VERSION="0.3.0"
+VERSION="0.3.1"
 
 # --- LOCATIONS ---
 # Resolve the script's real directory even when invoked via a symlink
