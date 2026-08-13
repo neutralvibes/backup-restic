@@ -3,4 +3,4 @@
 .venv
 .private
 .private-config
-
+.scripts

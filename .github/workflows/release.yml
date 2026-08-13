@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'          # triggers on v0.3.0, v1.0.0, v0.4.0-test, etc.
+
+jobs:
+  # Gate: fail the workflow if the script's VERSION doesn't match the tag.
+  version-check:
+    name: Verify VERSION matches tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare script VERSION with tag
+        run: |
+          # GITHUB_REF_NAME is the tag name, e.g. "v0.3.0" -> strip leading "v"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+
+          # Extract VERSION="..." from the script (same sed install.sh uses)
+          SCRIPT_VERSION="$(sed -n 's/^VERSION="\(.*\)".*$/\1/p' backup-restic | head -n1)"
+
+          echo "Tag version:    $TAG_VERSION"
+          echo "Script VERSION: $SCRIPT_VERSION"
+
+          if [ "$TAG_VERSION" != "$SCRIPT_VERSION" ]; then
+            echo "::error::Version mismatch: tag is '$TAG_VERSION' but backup-restic declares VERSION=\"$SCRIPT_VERSION\". Fix VERSION in the script or retag."
+            exit 1
+          fi
+          echo "OK: tag and script VERSION match ($SCRIPT_VERSION)."
+
+  # Optional: only create the GitHub Release if the check above passed.
+  # Delete this job if you just want the check and prefer manual releases.
+  release:
+    name: Create GitHub Release
+    needs: version-check            # <- the gate: skipped if version-check fails
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create release from tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes
