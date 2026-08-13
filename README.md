@@ -4,8 +4,7 @@ A **job-based wrapper around [restic](https://restic.net/)** that turns per-repo
 backup chores into declarative, self-contained jobs — with security validation,
 hooks, notifications, retention/prune control, and logging built in.
 
-> **Status:** pre-release (`0.3.0-test`). The interface and behaviour are stable for
-> testing, but pin your versions and test restores before trusting it with data you
+> **Status:** please test restores before trusting it with data you
 > can't afford to lose.
 
 ---
