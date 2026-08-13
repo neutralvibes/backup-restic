@@ -1,0 +1,15 @@
+# .shellcheckrc - Project configuration for ShellCheck
+
+# Treat warnings and errors as pipeline failures, but allow info/style to pass
+#severity=warning
+
+# Require explicit bash/sh shebang declarations at the top of files
+source-path=SCRIPTDIR
+
+# Disable specific rules globally across the project if they are too noisy
+# e.g., SC1091 (Not following external source files)
+# e.g., SC2034 (Variable appears unused - common in BATS helpers)
+#disable=SC1091,SC2034
+
+# Enable extra strictness checks for robust scripts
+enable=quote-safe-variables,check-unassigned-uppercase

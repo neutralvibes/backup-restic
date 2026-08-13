@@ -1,0 +1,119 @@
+# ===========================================================================
+# backup-restic global configuration  (backup-restic.conf)
+# ===========================================================================
+#
+# This file is sourced by backup-restic before any job config. Values set
+# here act as defaults for every job; individual jobs in jobs.d/<job>.conf
+# can override them.
+#
+# LOCATION:
+#   Lives in the same directory as the script (following symlinks), so
+#   typically /opt/backup-restic/backup-restic.conf.
+#
+# SECURITY:
+#   This file is treated as trusted input. When backup-restic runs as root it
+#   MUST be owned by root, and it must never be writable by group or other
+#   users. backup-restic refuses to load it otherwise. Recommended:
+#       chown root:root backup-restic.conf && chmod 0640 backup-restic.conf
+#
+# PRECEDENCE:
+#   built-in default  ->  this file (backup-restic.conf)  ->  jobs.d/<job>.conf
+
+# ---------------------------------------------------------------------------
+# Repository defaults
+# ---------------------------------------------------------------------------
+
+# File containing the restic repository password (single line). Jobs that do
+# not set their own PASSWORD_FILE fall back to this. Must be readable by the
+# user running backup-restic (usually root), and itself root-owned / 0600.
+#DEFAULT_PASSWORD_FILE="/etc/backup-restic/restic-password"
+
+# Base directory under which per-job repositories live. If a job sets
+# REPO_NAME="store", its repo resolves to $DEFAULT_REPO_BASE/store.
+#DEFAULT_REPO_BASE="/mnt/backups/restic"
+
+# Shared repository name used when a job sets neither REPO nor REPO_NAME.
+# Handy when every job backs up into one common repository (jobs are kept
+# apart inside it via restic tags). Leave empty to require each job to name
+# its own repo. Requires DEFAULT_REPO_BASE to be set.
+#DEFAULT_REPO_NAME=""
+
+# ---------------------------------------------------------------------------
+# Retention & pruning
+# ---------------------------------------------------------------------------
+
+# Default retention policy, passed straight to `restic forget`. Jobs can
+# override this with their own RETENTION array.
+#DEFAULT_RETENTION=(--keep-daily 7 --keep-weekly 4 --keep-monthly 6)
+
+# When the retention step runs during `backup-restic run`:
+#   after  - forget old snapshots after a successful backup (default)
+#   before - forget old snapshots before the backup starts
+# Jobs can override this with FORGET_WHEN.
+#DEFAULT_FORGET_WHEN="after"
+
+# Whether the retention step inside `run` also PRUNES (reclaims disk space).
+# Pruning can be slow and expensive, so the default is false: retention drops
+# old snapshots from the index but does NOT free space. Reclaim space later
+# with `backup-restic prune JOB`, or set this to true to do it automatically.
+#   true  - `run` forgets AND prunes
+#   false - `run` only forgets; prune separately (default)
+# Jobs can override this with FORGET_AUTO_PRUNE.
+#DEFAULT_FORGET_AUTO_PRUNE="false"
+
+# ---------------------------------------------------------------------------
+# Hooks
+# ---------------------------------------------------------------------------
+
+# What to do when a job's BEFORE_BACKUP hook fails:
+#   abort  - stop the job; the backup is not attempted (default)
+#   ignore - log a warning and carry on with the backup anyway
+# Jobs can override this with BEFORE_BACKUP_FAILURE.
+#DEFAULT_BEFORE_BACKUP_FAILURE="abort"
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+# Directory for per-job log files. Each job writes to $LOG_DIR/<job>.log, and
+# `run --all` also writes a summary to $LOG_DIR/all.log.
+#LOG_DIR="/var/log/backup-restic"
+
+# ---------------------------------------------------------------------------
+# Restic
+# ---------------------------------------------------------------------------
+
+# Minimum restic version required. backup-restic refuses to run against an
+# older restic. `restic prune` and `backup --dry-run` both exist by 0.12.0.
+#MIN_RESTIC_VERSION="0.12.0"
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+
+# How to notify about job results:
+#   none    - no notifications (default)
+#   pushover- send via Pushover (needs PUSHOVER_TOKEN and PUSHOVER_USER)
+#   webhook - POST a JSON payload to WEBHOOK_URL
+# Jobs can override this with NOTIFY_METHOD_OVERRIDE.
+#NOTIFY_METHOD="none"
+
+# When to notify:
+#   failure - only when a job fails (default)
+#   success - only when a job succeeds
+#   both    - always
+# Jobs can override this with NOTIFY_ON_OVERRIDE.
+#NOTIFY_ON="failure"
+
+# Optional file (bash-sourced) holding notification secrets such as
+# PUSHOVER_TOKEN, PUSHOVER_USER and WEBHOOK_URL. It is loaded LAZILY - only at
+# the moment a notification is actually sent - so secrets do not sit in the
+# environment for the whole backup run. Like this file, it must be root-owned
+# and not group/world writable (chmod 0600).
+#NOTIFY_CREDENTIALS_FILE="/etc/backup-restic/notify-credentials"
+
+# Secrets can also be set directly here, but that loads them for the entire
+# run and is less tidy. Prefer NOTIFY_CREDENTIALS_FILE for anything sensitive.
+#PUSHOVER_TOKEN=""
+#PUSHOVER_USER=""
+#WEBHOOK_URL=""

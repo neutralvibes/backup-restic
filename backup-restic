@@ -1,0 +1,1089 @@
+#!/bin/env bash
+# backup-restic - a job-based wrapper around restic
+#
+# Requires bash >= 4.4 (relies on empty-array expansion "${arr[@]}" under `set -u`).
+set -uo pipefail
+VERSION="0.3.0-test"
+
+# --- LOCATIONS ---
+# Resolve the script's real directory even when invoked via a symlink
+# (e.g. /usr/local/bin/backup-restic -> /opt/backup-restic/backup-restic),
+# so the script, its config, and its jobs.d all live together under one directory.
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+CONFIG_DIR="${BACKUP_RESTIC_CONFIG_DIR:-$SCRIPT_DIR}"
+GLOBAL_CONF="${CONFIG_DIR}/backup-restic.conf"
+JOBS_DIR="${CONFIG_DIR}/jobs.d"
+
+# --- DEFAULTS (overridden by global conf, then by job conf) ---
+DEFAULT_PASSWORD_FILE=""
+DEFAULT_REPO_NAME=""
+DEFAULT_REPO_BASE=""
+DEFAULT_RETENTION=(--keep-daily 7 --keep-weekly 4 --keep-monthly 6)
+DEFAULT_FORGET_WHEN="after"                 # after | before
+DEFAULT_FORGET_AUTO_PRUNE="false"           # true | false
+DEFAULT_BEFORE_BACKUP_FAILURE="abort"       # abort | ignore
+NOTIFY_METHOD="none"
+NOTIFY_ON="failure"
+NOTIFY_CREDENTIALS_FILE=""
+PUSHOVER_TOKEN=""
+PUSHOVER_USER=""
+WEBHOOK_URL=""
+QUIET=0
+MIN_RESTIC_VERSION="0.15.0"
+
+# Logs default to a system dir when running as root, and to the user's XDG
+# state dir otherwise, so a non-root install has somewhere it can write.
+if (( EUID == 0 )); then
+    LOG_DIR="/var/log/backup-restic"
+else
+    LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/backup-restic"
+fi
+
+# --- RUNTIME STATE ---
+FAILURE_DETAIL=""
+DRYRUN_TEMP_REPO=""
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+require_root() {
+    (( EUID == 0 )) || die "must be run as root"
+}
+
+validate_trusted_file() {
+    local file="$1"
+    local label="${2:-file}"
+    local owner owner_name mode dir
+
+    [ -f "$file" ] || die "$label '$file' is not a regular file"
+    [ ! -L "$file" ] || die "$label '$file' must not be a symlink"
+
+    owner="$(stat -c '%u' "$file")" || die "cannot inspect $label '$file'"
+    owner_name="$(stat -c '%U' "$file")" || die "cannot inspect $label '$file'"
+
+    if (( EUID == 0 )); then
+        [ "$owner" -eq 0 ] ||
+            die "$label '$file' is owned by $owner_name; root may only use root-owned configuration and hooks"
+    else
+        [ "$owner" -eq 0 ] || [ "$owner" -eq "$EUID" ] ||
+            die "$label '$file' is owned by $owner_name; it must be owned by root or by the user running backup-restic"
+    fi
+
+    mode="$(stat -c '%a' "$file")" || die "cannot inspect permissions on $label '$file'"
+    (( (8#$mode & 022) == 0 )) ||
+        die "$label '$file' is writable by group or other users; for security, backup-restic will not use it"
+
+    [ -r "$file" ] ||
+        die "$label '$file' is not readable by the current user; check its ownership and permissions"
+
+    dir="$(dirname "$file")"
+    while [ "$dir" != "/" ]; do
+        mode="$(stat -c '%a' "$dir")" || die "cannot inspect directory '$dir'"
+        if (( (8#$mode & 022) != 0 )) && (( (8#$mode & 01000) == 0 )); then
+            die "directory '$dir' is group/world writable without sticky-bit protection; cannot safely trust '$file'"
+        fi
+        dir="$(dirname "$dir")"
+    done
+}
+
+validate_hook() {
+    local file="$1"
+    validate_trusted_file "$file" "hook"
+    [ -x "$file" ] || die "hook '$file' is not executable"
+}
+
+acquire_lock() {
+    # The lock lives in LOG_DIR (per-install, per-user) rather than a shared
+    # /tmp or /run/lock path, so independent installs don't collide and there
+    # is no world-writable symlink target to truncate.
+    mkdir -p "$LOG_DIR" || die "cannot create lock/log directory '$LOG_DIR'"
+    local lock_file="$LOG_DIR/.backup-restic.lock"
+    [ -L "$lock_file" ] && die "lock file '$lock_file' is a symlink; refusing to use it"
+    exec 9>"$lock_file" || die "cannot open lock file '$lock_file'"
+    flock -n 9 || die "another backup-restic process is already running"
+}
+
+format_elapsed() {
+    local seconds="$1"
+    printf '%02d:%02d:%02d' \
+        "$((seconds / 3600))" \
+        "$(((seconds % 3600) / 60))" \
+        "$((seconds % 60))"
+}
+
+run_banner() {
+    local job="$1"
+    local mode="$2"
+    log "================================================================================"
+    log "[$(date '+%Y-%m-%d %H:%M:%S')] JOB: $job | $mode"
+    log "================================================================================"
+}
+
+finish_banner() {
+    local job="$1"
+    local mode="$2"
+    local result="$3"
+    local elapsed="$4"
+    log "================================================================================"
+    log "[$(date '+%Y-%m-%d %H:%M:%S')] JOB: $job | $mode $result | elapsed $(format_elapsed "$elapsed")"
+    log "================================================================================"
+}
+
+usage() {
+    cat <<'EOF'
+backup-restic - job-based wrapper around restic
+
+USAGE:
+  backup-restic ls                              List configured jobs
+  backup-restic ls JOB [restic args...]          List snapshots for a job
+  backup-restic ls JOB SNAPSHOT [restic args...] List files in a snapshot
+  backup-restic config JOB                       Show a job's fully resolved config
+  backup-restic edit JOB                         Open a job's config file in $EDITOR (default: nano)
+  backup-restic run JOB [restic args...]        Run a backup job (backup + retention)
+  backup-restic run --all [restic args...]      Run every configured job
+                                                -q/--quiet: log to file only, not stdout
+  backup-restic forget JOB [restic args...]      Apply retention policy only (cheap; no prune)
+  backup-restic prune JOB [restic args...]       Prune repo to reclaim space (expensive)
+  backup-restic check JOB [restic args...]      Check repo integrity
+  backup-restic unlock JOB [restic args...]      Remove stale locks
+  backup-restic init JOB [restic args...]      Initialise a job's repo
+  backup-restic restore JOB SNAPSHOT [restic args...]
+                                               Restore a snapshot to DIR
+  backup-restic --completion [print|install]    Bash completion (default: print)
+  backup-restic --logrotate [print|install]     Logrotate config (default: print)
+  backup-restic --version                       Print version
+  backup-restic --help                          This message
+
+EXAMPLES:
+  backup-restic ls
+  backup-restic config pve
+  backup-restic edit pve
+  backup-restic ls pve latest
+  backup-restic run pve
+  backup-restic run --all
+  backup-restic run store --dry-run
+  backup-restic forget store              # apply retention policy (cheap)
+  backup-restic forget store --prune      # ...and reclaim space in the same step
+  backup-restic prune store               # reclaim space only (expensive)
+  backup-restic check pve --read-data
+  backup-restic restore pve a1b2c3d4 --target /tmp/restore-test
+
+Config lives alongside the script: backup-restic.conf (global) and
+jobs.d/<job>.conf (per job), both in the same directory as this script
+(following symlinks - so /opt/backup-restic/ is the single source of truth
+even if you symlink the binary into /usr/local/bin).
+EOF
+}
+
+require_restic() {
+    command -v restic >/dev/null || die "restic is not installed"
+    local ver
+    ver="$(restic version 2>/dev/null | awk '{print $2}')"
+    if [ -z "$ver" ]; then
+        echo "WARNING: could not determine restic version; skipping version check" >&2
+        return 0
+    fi
+    local lowest
+    lowest="$(printf '%s\n%s\n' "$MIN_RESTIC_VERSION" "$ver" | sort -V | head -n1)"
+    if [ "$lowest" = "$ver" ] && [ "$ver" != "$MIN_RESTIC_VERSION" ]; then
+        die "restic $ver is too old; backup-restic requires restic >= $MIN_RESTIC_VERSION"
+    fi
+}
+
+json_escape() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    printf '%s' "$s"
+}
+
+# Ensure LOG_DIR and LOG_FILE exist with hardened permissions so log output
+# (which may include hook stdout/stderr) is not left world-readable due to a
+# permissive umask. Called whenever LOG_FILE is (re)pointed.
+ensure_log_path() {
+    mkdir -p "$LOG_DIR" || die "cannot create log directory '$LOG_DIR'"
+    chmod 750 "$LOG_DIR" 2>/dev/null ||
+        echo "WARNING: could not set mode 750 on $LOG_DIR" >&2
+    : >>"$LOG_FILE" || die "cannot write to log file '$LOG_FILE'"
+    chmod 640 "$LOG_FILE" 2>/dev/null ||
+        echo "WARNING: could not set mode 640 on $LOG_FILE" >&2
+}
+
+cleanup_dryrun_repo() {
+    if [ -n "$DRYRUN_TEMP_REPO" ]; then
+        rm -rf "$DRYRUN_TEMP_REPO"
+    fi
+}
+
+# Load global config if present. Notification credentials are deliberately NOT
+# loaded here; notify() sources them lazily so secrets only enter the
+# environment at the moment a notification is actually sent.
+load_global() {
+    if [ -f "$GLOBAL_CONF" ]; then
+        validate_trusted_file "$GLOBAL_CONF" "global config"
+        # shellcheck disable=SC1090  # dynamic path, validated above
+        source "$GLOBAL_CONF" || die "failed to load global config '$GLOBAL_CONF'; check that it is readable and valid"
+    fi
+}
+
+# Load a job's config, resetting job-scoped vars first so jobs never leak
+# settings into each other when running --all in one process.
+load_job() {
+    local job="$1"
+    [[ "$job" =~ ^[A-Za-z0-9._-]+$ ]] ||
+        die "invalid job name '$job' (use only A-Z, a-z, 0-9, '.', '_' and '-')"
+    local job_conf="${JOBS_DIR}/${job}.conf"
+    [ -f "$job_conf" ] || die "no such job: $job (expected $job_conf)"
+
+    REPO=""
+    REPO_NAME=""
+    PASSWORD_FILE="$DEFAULT_PASSWORD_FILE"
+    PATHS=()
+    EXCLUDES=()
+    RETENTION=("${DEFAULT_RETENTION[@]}")
+    MOUNT_CHECK=""
+    BEFORE_BACKUP=""
+    AFTER_BACKUP=""
+    BEFORE_BACKUP_FAILURE="$DEFAULT_BEFORE_BACKUP_FAILURE"
+    FORGET_WHEN="$DEFAULT_FORGET_WHEN"
+    FORGET_AUTO_PRUNE="$DEFAULT_FORGET_AUTO_PRUNE"
+    JOB_NOTIFY_METHOD="$NOTIFY_METHOD"
+    JOB_NOTIFY_ON="$NOTIFY_ON"
+    NOTIFY_METHOD_OVERRIDE=""
+    NOTIFY_ON_OVERRIDE=""
+
+    validate_trusted_file "$job_conf" "job config"
+    # shellcheck disable=SC1090  # dynamic path, validated above
+    source "$job_conf" || die "failed to load job config '$job_conf'; check that it is readable and valid"
+
+    [ -n "$NOTIFY_METHOD_OVERRIDE" ] && JOB_NOTIFY_METHOD="$NOTIFY_METHOD_OVERRIDE"
+    [ -n "$NOTIFY_ON_OVERRIDE" ] && JOB_NOTIFY_ON="$NOTIFY_ON_OVERRIDE"
+
+    if [ -z "$REPO" ]; then
+        local repo_name="$REPO_NAME"
+        [ -n "$repo_name" ] || repo_name="$DEFAULT_REPO_NAME"
+        [ -n "$repo_name" ] || die "job '$job': set REPO or REPO_NAME in $job_conf, or set DEFAULT_REPO_NAME in global config for a shared repo"
+        [ -n "$DEFAULT_REPO_BASE" ] || die "job '$job': repo name '$repo_name' set but no DEFAULT_REPO_BASE in global config"
+        REPO="${DEFAULT_REPO_BASE}/${repo_name}"
+    fi
+
+    # A bare relative local path (no leading / and no scheme like sftp:/s3:)
+    # would otherwise resolve against the CWD - unpredictable. Anchor it to
+    # CONFIG_DIR and say so loudly rather than resolving it silently.
+    if [[ "$REPO" != /* ]] && [[ ! "$REPO" =~ ^[A-Za-z][A-Za-z0-9+.-]*: ]]; then
+        local resolved_repo="${CONFIG_DIR}/${REPO}"
+        echo "WARNING: job '$job' repo '$REPO' is a relative path - resolved to '$resolved_repo' (anchored to $CONFIG_DIR, not your current directory). Use an absolute path to avoid this warning." >&2
+        REPO="$resolved_repo"
+    fi
+
+    [ -n "$PASSWORD_FILE" ] || die "job '$job': no password file (set PASSWORD_FILE or DEFAULT_PASSWORD_FILE)"
+    validate_trusted_file "$PASSWORD_FILE" "password file"
+
+    [ "${#PATHS[@]}" -gt 0 ] || die "job '$job': PATHS is empty in $job_conf"
+
+    case "$FORGET_WHEN" in
+        after|before) ;;
+        *) die "job '$job': FORGET_WHEN must be 'after' or 'before', got '$FORGET_WHEN'" ;;
+    esac
+
+    case "$BEFORE_BACKUP_FAILURE" in
+        abort|ignore) ;;
+        *) die "job '$job': BEFORE_BACKUP_FAILURE must be 'abort' or 'ignore', got '$BEFORE_BACKUP_FAILURE'" ;;
+    esac
+
+    case "$FORGET_AUTO_PRUNE" in
+        true|false) ;;
+        *) die "job '$job': FORGET_AUTO_PRUNE must be 'true' or 'false', got '$FORGET_AUTO_PRUNE'" ;;
+    esac
+
+    export RESTIC_REPOSITORY="$REPO"
+    export RESTIC_PASSWORD_FILE="$PASSWORD_FILE"
+    JOB_NAME="$job"
+    LOG_FILE="${LOG_DIR}/${job}.log"
+    ensure_log_path
+}
+
+log() {
+    local line="[$(date -Is)] $*"
+    if [ -n "${LOG_FILE:-}" ]; then
+        mkdir -p "$LOG_DIR"
+        if [ "$QUIET" = "1" ]; then
+            echo "$line" >>"$LOG_FILE"
+        else
+            echo "$line" | tee -a "$LOG_FILE"
+        fi
+    else
+        echo "$line"
+    fi
+}
+
+# Runs a command, sending its output to the log file always, and additionally
+# to stdout unless QUIET=1. Exit status is preserved through the pipe because
+# `set -o pipefail` is active.
+run_logged() {
+    if [ "$QUIET" = "1" ]; then
+        "$@" >>"$LOG_FILE" 2>&1
+    else
+        "$@" 2>&1 | tee -a "$LOG_FILE"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# notifications
+# ---------------------------------------------------------------------------
+notify() {
+    local job="$1" status="$2" reason="$3" message="$4"
+    local method="${JOB_NOTIFY_METHOD:-none}" on="${JOB_NOTIFY_ON:-failure}"
+
+    [ "$method" != "none" ] || return 0
+
+    case "$on" in
+        success)
+            [ "$status" = "success" ] || { log "notify: skipped ($job, status=$status) - NOTIFY_ON=success"; return 0; }
+            ;;
+        failure)
+            # Notify on failures AND warnings (a warning is "not clean").
+            [ "$status" = "failure" ] || [ "$status" = "warning" ] ||
+                { log "notify: skipped ($job, status=$status) - NOTIFY_ON=failure"; return 0; }
+            ;;
+        both) ;;
+        *)
+            log "notify: skipped ($job) - unrecognised NOTIFY_ON '$on'"
+            return 0
+            ;;
+    esac
+
+    # Load credentials lazily. Validate in a subshell so an untrusted file
+    # causes a skip rather than aborting the whole run.
+    if [ -n "${NOTIFY_CREDENTIALS_FILE:-}" ]; then
+        if [ ! -r "$NOTIFY_CREDENTIALS_FILE" ]; then
+            log "notify: credentials file '$NOTIFY_CREDENTIALS_FILE' not readable; notification skipped"
+            return 0
+        fi
+        if ! ( validate_trusted_file "$NOTIFY_CREDENTIALS_FILE" "notification credentials" ); then
+            log "notify: credentials file could not be trusted; notification skipped"
+            return 0
+        fi
+        # shellcheck disable=SC1090  # dynamic path, validated above
+        if ! source "$NOTIFY_CREDENTIALS_FILE"; then
+            log "notify: failed to load notification credentials; notification skipped"
+            return 0
+        fi
+    fi
+
+    case "$method" in
+        pushover)
+            if [ -z "${PUSHOVER_TOKEN:-}" ] || [ -z "${PUSHOVER_USER:-}" ]; then
+                log "notify: pushover selected but PUSHOVER_TOKEN/PUSHOVER_USER not set; notification skipped"
+                return 0
+            fi
+            notify_pushover "$job" "$status" "$reason" "$message" ||
+                log "WARNING: pushover notification failed"
+            ;;
+        webhook)
+            if [ -z "${WEBHOOK_URL:-}" ]; then
+                log "notify: webhook selected but WEBHOOK_URL not set; notification skipped"
+                return 0
+            fi
+            notify_webhook "$job" "$status" "$reason" "$message" ||
+                log "WARNING: webhook notification failed"
+            ;;
+        *)
+            log "notify: unknown NOTIFY_METHOD '$method'"
+            ;;
+    esac
+    return 0
+}
+
+notify_pushover() {
+    local job="$1" status="$2" reason="$3" message="$4"
+    local response_file http_code curl_rc
+    response_file="$(mktemp "${TMPDIR:-/tmp}/backup-restic-pushover.XXXXXX")" || {
+        log "notify: could not create temporary response file"
+        return 1
+    }
+    local title="backup-restic: ${job} ${status}"
+    [ -n "$reason" ] && title="$title ($reason)"
+    http_code=$(curl -sS --max-time 10 -o "$response_file" -w '%{http_code}' \
+        --form-string "token=${PUSHOVER_TOKEN}" \
+        --form-string "user=${PUSHOVER_USER}" \
+        --form-string "title=${title}" \
+        --form-string "message=${message}" \
+        https://api.pushover.net/1/messages.json)
+    curl_rc=$?
+    if [ "$curl_rc" -ne 0 ]; then
+        log "notify: pushover curl failed (exit $curl_rc) - check network/DNS from this host"
+        rm -f "$response_file"
+        return 1
+    fi
+    if [ "$http_code" != "200" ]; then
+        log "notify: pushover rejected the message (HTTP $http_code): $(cat "$response_file" 2>/dev/null)"
+        rm -f "$response_file"
+        return 1
+    fi
+    log "notify: pushover notification sent"
+    rm -f "$response_file"
+    return 0
+}
+
+notify_webhook() {
+    local job="$1" status="$2" reason="$3" message="$4"
+    local payload
+    payload=$(printf '{"job":"%s","status":"%s","reason":"%s","message":"%s"}' \
+        "$(json_escape "$job")" \
+        "$(json_escape "$status")" \
+        "$(json_escape "$reason")" \
+        "$(json_escape "$message")")
+    if curl -fsS --max-time 10 -X POST "$WEBHOOK_URL" \
+        -H 'Content-Type: application/json' \
+        --data-binary "$payload" \
+        >/dev/null; then
+        log "notify: webhook sent"
+        return 0
+    fi
+    log "notify: webhook send failed"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+cmd_ls_jobs() {
+    [ -d "$JOBS_DIR" ] || die "jobs dir $JOBS_DIR not found"
+    local f name found=0
+    for f in "$JOBS_DIR"/*.conf; do
+        [ -e "$f" ] || continue
+        found=1
+        name="$(basename "$f" .conf)"
+        echo "$name"
+    done
+    [ "$found" -eq 1 ] || echo "(no jobs configured in $JOBS_DIR)"
+}
+
+cmd_config() {
+    local job="$1"
+    load_job "$job"
+    cat <<EOF
+Job:             $JOB_NAME
+Repo:            $RESTIC_REPOSITORY
+Password file:   $RESTIC_PASSWORD_FILE
+Paths:           ${PATHS[*]}
+Excludes:        ${EXCLUDES[*]:-(none)}
+Retention:       ${RETENTION[*]}
+Forget runs:     $FORGET_WHEN backup
+Auto prune:      $FORGET_AUTO_PRUNE
+Mount check:     ${MOUNT_CHECK:-(none)}
+Before hook:     ${BEFORE_BACKUP:-(none)}
+On hook fail:    $BEFORE_BACKUP_FAILURE
+After hook:      ${AFTER_BACKUP:-(none)}
+Notify method:   $JOB_NOTIFY_METHOD
+Notify on:       $JOB_NOTIFY_ON
+Log file:        $LOG_FILE
+EOF
+}
+
+cmd_edit() {
+    local job="$1"
+    local job_conf="${JOBS_DIR}/${job}.conf"
+    [ -f "$job_conf" ] || die "no such job: $job (expected $job_conf)"
+    validate_trusted_file "$job_conf" "job config"
+    [ -w "$job_conf" ] || die "cannot edit job config '$job_conf': it is not writable by $(id -un). It is probably managed by root; edit it as root or change its ownership."
+    local editor="${EDITOR:-nano}"
+    command -v "$editor" >/dev/null || die "editor '$editor' not found on PATH"
+    "$editor" "$job_conf"
+}
+
+cmd_ls() {
+    if [ "$#" -eq 0 ]; then
+        cmd_ls_jobs
+        return 0
+    fi
+    local job="$1"
+    shift
+    load_job "$job"
+    if [ "$#" -eq 0 ]; then
+        run_logged restic snapshots --tag "$job"
+        return
+    fi
+    local snapshot="$1"
+    shift
+    run_logged restic ls --tag "$job" "$snapshot" "$@"
+}
+
+cmd_init() {
+    local job="$1"; shift
+    load_job "$job"
+    if restic snapshots >/dev/null 2>&1; then
+        echo "Repo for '$job' already initialised."
+    else
+        run_logged restic init "$@"
+    fi
+}
+
+cmd_check() {
+    local job="$1"; shift
+    load_job "$job"
+    run_logged restic check "$@"
+}
+
+cmd_unlock() {
+    local job="$1"; shift
+    load_job "$job"
+    run_logged restic unlock "$@"
+}
+
+cmd_forget() {
+    local job="$1"; shift
+    load_job "$job"
+    run_logged restic forget --tag "$job" "${RETENTION[@]}" "$@"
+}
+
+cmd_prune() {
+    local job="$1"; shift
+    load_job "$job"
+    run_logged restic prune "$@"
+}
+
+cmd_restore() {
+    local job="$1"
+    local snapshot="$2"
+    shift 2
+    local target=""
+    local -a restic_args=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --target)
+                [ "$#" -ge 2 ] || die "restore requires a value after --target"
+                target="$2"
+                shift 2
+                ;;
+            --)
+                shift
+                restic_args+=("$@")
+                break
+                ;;
+            *)
+                restic_args+=("$1")
+                shift
+                ;;
+        esac
+    done
+    [ -n "$target" ] || die "restore requires --target DIR"
+    load_job "$job"
+    mkdir -p "$target" || die "cannot create restore target directory '$target'"
+    run_logged restic restore "$snapshot" --target "$target" "${restic_args[@]}"
+}
+
+run_backup() {
+    local job="$1"
+    local dry_run="$2"
+    shift 2
+    local -a restic_args=("$@")
+
+    # Preflight: mount check (before-hook is expected to have mounted if needed)
+    if [ -n "$MOUNT_CHECK" ] && ! mountpoint -q "$MOUNT_CHECK"; then
+        FAILURE_DETAIL="$MOUNT_CHECK is not mounted"
+        log "[$job] FAILED: $FAILURE_DETAIL"
+        return 1
+    fi
+
+    # Preflight: every source path must exist
+    local p
+    for p in "${PATHS[@]}"; do
+        if [ ! -e "$p" ]; then
+            FAILURE_DETAIL="path '$p' does not exist"
+            log "[$job] FAILED: $FAILURE_DETAIL"
+            return 1
+        fi
+    done
+
+    # Ensure the repository is initialised
+    if ! restic snapshots >/dev/null 2>&1; then
+        if (( dry_run )); then
+            log "[$job] repo is not initialised, but a dry-run needs a repo to talk to."
+            if [ -t 0 ]; then
+                log "[$job] backup-restic can create a TEMPORARY throwaway repo, run the"
+                log "[$job] dry-run against it, then delete it. Your real repo is untouched."
+                local answer=""
+                read -r -p "Create a temporary repo for this dry-run? [y/N] " answer
+                case "$answer" in
+                    y|Y|yes|YES|Yes)
+                        DRYRUN_TEMP_REPO="$(mktemp -d "${TMPDIR:-/tmp}/backup-restic-dryrun.XXXXXX")" || {
+                            FAILURE_DETAIL="could not create temporary repo dir"
+                            log "[$job] FAILED: $FAILURE_DETAIL"
+                            return 1
+                        }
+                        trap cleanup_dryrun_repo EXIT
+                        if ! RESTIC_REPOSITORY="$DRYRUN_TEMP_REPO" restic init >/dev/null 2>&1; then
+                            FAILURE_DETAIL="could not initialise temporary repo"
+                            log "[$job] FAILED: $FAILURE_DETAIL"
+                            rm -rf "$DRYRUN_TEMP_REPO"
+                            DRYRUN_TEMP_REPO=""
+                            return 1
+                        fi
+                        log "[$job] using temporary repo: $DRYRUN_TEMP_REPO (removed afterwards)"
+                        ;;
+                    *)
+                        log "[$job] dry-run skipped (repo not initialised; temporary repo declined)"
+                        return 0
+                        ;;
+                esac
+            else
+                log "[$job] repo not initialised and stdin is not a terminal; dry-run skipped"
+                return 0
+            fi
+        else
+            log "[$job] repo not initialised, running restic init"
+            if ! run_logged restic init; then
+                FAILURE_DETAIL="restic init failed"
+                log "[$job] FAILED: $FAILURE_DETAIL"
+                return 1
+            fi
+        fi
+    fi
+
+    local -a exclude_args=()
+    local e
+    for e in "${EXCLUDES[@]}"; do
+        [ -n "$e" ] && exclude_args+=(--exclude "$e")
+    done
+
+    local -a backup_cmd=(restic backup --tag "$job" "${exclude_args[@]}" "${restic_args[@]}" "${PATHS[@]}")
+    local backup_status=0
+    if [ -n "$DRYRUN_TEMP_REPO" ]; then
+        RESTIC_REPOSITORY="$DRYRUN_TEMP_REPO" run_logged "${backup_cmd[@]}" || backup_status=$?
+        rm -rf "$DRYRUN_TEMP_REPO"
+        DRYRUN_TEMP_REPO=""
+        log "[$job] temporary repo removed"
+    else
+        run_logged "${backup_cmd[@]}" || backup_status=$?
+    fi
+
+    case "$backup_status" in
+        0)
+            return 0
+            ;;
+        3)
+            FAILURE_DETAIL="backup completed but some files could not be read (restic exit 3)"
+            log "[$job] WARNING: $FAILURE_DETAIL"
+            return 3
+            ;;
+        *)
+            FAILURE_DETAIL="restic backup exited $backup_status"
+            log "[$job] FAILED: $FAILURE_DETAIL"
+            return 1
+            ;;
+    esac
+}
+
+run_retention() {
+    local job="$1"
+    local -a prune_args=()
+    [ "$FORGET_AUTO_PRUNE" = "true" ] && prune_args+=(--prune)
+    if ! run_logged restic forget --tag "$job" "${RETENTION[@]}" "${prune_args[@]}"; then
+        FAILURE_DETAIL="retention failed"
+        return 1
+    fi
+    return 0
+}
+
+run_one_job() {
+    local job="$1"
+    shift
+    local dry_run=0
+    local mode="BACKUP"
+    local primary_status="success"
+    local primary_reason=""
+    local after_hook_failed=0
+    local start elapsed
+    start="$(date +%s)"
+
+    # --dry-run arrives as part of the restic args
+    [[ " $* " == *" --dry-run "* ]] && dry_run=1
+    (( dry_run )) && mode="DRY RUN"
+
+    load_job "$job"
+
+    FAILURE_DETAIL=""
+    run_banner "$job" "$mode"
+    log "[$job] repo: $RESTIC_REPOSITORY"
+
+    export BACKUP_RESTIC_JOB="$job"
+    export BACKUP_RESTIC_DRY_RUN="$dry_run"
+    export BACKUP_RESTIC_MODE="$mode"
+
+    # ---- before-hook ----
+    if [ -n "${BEFORE_BACKUP:-}" ]; then
+        if ! ( validate_hook "$BEFORE_BACKUP" ); then
+            FAILURE_DETAIL="before-hook failed validation"
+            log "[$job] before-hook '$BEFORE_BACKUP' failed validation"
+            if [ "$BEFORE_BACKUP_FAILURE" = "ignore" ]; then
+                log "[$job] WARNING: continuing because BEFORE_BACKUP_FAILURE=ignore"
+            else
+                primary_status="failure"
+                primary_reason="before_hook"
+            fi
+        else
+            log "[$job] running before-hook: $BEFORE_BACKUP${dry_run:+ (DRY RUN)}"
+            if ! BACKUP_RESTIC_PHASE="before" BACKUP_RESTIC_STATUS="success" BACKUP_RESTIC_REASON="" \
+                    run_logged "$BEFORE_BACKUP"; then
+                FAILURE_DETAIL="before-hook failed"
+                log "[$job] before-hook failed"
+                if [ "$BEFORE_BACKUP_FAILURE" = "ignore" ]; then
+                    log "[$job] WARNING: continuing because BEFORE_BACKUP_FAILURE=ignore"
+                else
+                    primary_status="failure"
+                    primary_reason="before_hook"
+                fi
+            fi
+        fi
+    fi
+
+    # ---- pre-backup retention (FORGET_WHEN=before) ----
+    if [ "$primary_status" = "success" ] && (( ! dry_run )) && [ "$FORGET_WHEN" = "before" ]; then
+        log "[$job] running retention before backup (FORGET_WHEN=before)"
+        if ! run_retention "$job"; then
+            log "[$job] WARNING: pre-backup retention failed (continuing with backup)"
+        fi
+    fi
+
+    # ---- backup ----
+    if [ "$primary_status" = "success" ]; then
+        run_backup "$job" "$dry_run" "$@"
+        local backup_rc=$?
+        case "$backup_rc" in
+            0)
+                log "[$job] backup completed successfully"
+                ;;
+            3)
+                log "[$job] backup completed with warnings"
+                primary_status="warning"
+                primary_reason="backup"
+                ;;
+            *)
+                log "[$job] backup failed"
+                primary_status="failure"
+                primary_reason="backup"
+                ;;
+        esac
+    else
+        log "[$job] backup skipped (already failed: $primary_reason)"
+    fi
+
+    # ---- post-backup retention (FORGET_WHEN=after, the default) ----
+    # A warning backup still gets retention applied; only a real failure skips it.
+    if [ "$primary_status" != "failure" ] && (( ! dry_run )) && [ "$FORGET_WHEN" = "after" ]; then
+        if ! run_retention "$job"; then
+            log "[$job] WARNING: post-backup retention failed (backup itself succeeded)"
+        fi
+    elif (( dry_run )); then
+        log "[$job] skipping retention during dry-run"
+    fi
+
+    # ---- after-hook (runs even on failure) ----
+    if [ -n "${AFTER_BACKUP:-}" ]; then
+        if ! ( validate_hook "$AFTER_BACKUP" ); then
+            log "[$job] after-hook '$AFTER_BACKUP' failed validation"
+            after_hook_failed=1
+            [ -n "$FAILURE_DETAIL" ] || FAILURE_DETAIL="after-hook failed validation"
+        else
+            log "[$job] running after-hook: $AFTER_BACKUP${dry_run:+ (DRY RUN)}"
+            if ! BACKUP_RESTIC_PHASE="after" BACKUP_RESTIC_STATUS="$primary_status" BACKUP_RESTIC_REASON="$primary_reason" \
+                    run_logged "$AFTER_BACKUP"; then
+                log "[$job] after-hook failed"
+                after_hook_failed=1
+                [ -n "$FAILURE_DETAIL" ] || FAILURE_DETAIL="after-hook failed"
+            fi
+        fi
+    fi
+
+    if [ "$primary_status" != "failure" ] && (( after_hook_failed )); then
+        primary_status="failure"
+        primary_reason="after_hook"
+    elif [ "$primary_status" = "failure" ] && (( after_hook_failed )); then
+        log "[$job] WARNING: after-hook also failed; preserving primary reason '$primary_reason'"
+    fi
+
+    elapsed=$(( $(date +%s) - start ))
+    local result_label
+    case "$primary_status" in
+        success) result_label="COMPLETED" ;;
+        warning) result_label="COMPLETED WITH WARNINGS" ;;
+        *)       result_label="FAILED" ;;
+    esac
+    finish_banner "$job" "$mode" "$result_label" "$elapsed"
+
+    # Build a human-readable notification message with reason and detail.
+    local notify_msg="Job $job: $primary_status"
+    [ -n "$primary_reason" ] && notify_msg="$notify_msg | reason: $primary_reason"
+    [ -n "$FAILURE_DETAIL" ] && notify_msg="$notify_msg | detail: $FAILURE_DETAIL"
+    (( dry_run )) && notify_msg="$notify_msg [dry-run]"
+    notify_msg="$notify_msg (elapsed: $(format_elapsed "$elapsed"))"
+
+    notify "$job" "$primary_status" "$primary_reason" "$notify_msg"
+
+    # Return 0 = success, 3 = completed with warnings, 1 = failure. cmd_run
+    # uses 3 to list warning jobs in the --all summary, but maps it back to an
+    # overall success so warnings never fail the run.
+    case "$primary_status" in
+        success) return 0 ;;
+        warning) return 3 ;;
+        *)       return 1 ;;
+    esac
+}
+
+cmd_run() {
+    local job="" all=0
+    local -a restic_args=()
+
+    if [ "${1:-}" = "--all" ]; then
+        all=1
+        shift
+    else
+        [ -n "${1:-}" ] || die "usage: backup-restic run JOB|--all [restic args...]"
+        job="$1"
+        shift
+    fi
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -q|--quiet)
+                QUIET=1
+                shift
+                ;;
+            --dry-run)
+                restic_args+=("$1")
+                shift
+                ;;
+            --)
+                shift
+                restic_args+=("$@")
+                break
+                ;;
+            *)
+                restic_args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    local overall=0
+    if [ "$all" = "1" ]; then
+        local all_start
+        all_start="$(date +%s)"
+        local -a warning_jobs=()
+        local f name rc found=0
+        for f in "$JOBS_DIR"/*.conf; do
+            [ -e "$f" ] || continue
+            found=1
+            name="$(basename "$f" .conf)"
+            run_one_job "$name" "${restic_args[@]}"
+            rc=$?
+            case "$rc" in
+                3) warning_jobs+=("$name") ;;
+                0) ;;
+                *) overall=1 ;;
+            esac
+        done
+        [ "$found" -eq 1 ] || die "no job configs found in $JOBS_DIR"
+        local all_elapsed=$(( $(date +%s) - all_start ))
+        LOG_FILE="${LOG_DIR}/all.log"
+        ensure_log_path
+        local all_result
+        if [ "$overall" -ne 0 ]; then
+            all_result="FAILED"
+        elif [ "${#warning_jobs[@]}" -gt 0 ]; then
+            all_result="COMPLETED WITH WARNINGS"
+        else
+            all_result="COMPLETED"
+        fi
+        local summary="ALL JOBS $all_result | elapsed $(format_elapsed "$all_elapsed")"
+        if [ "${#warning_jobs[@]}" -gt 0 ]; then
+            summary="$summary | warnings in: ${warning_jobs[*]}"
+        fi
+        log "================================================================================"
+        log "[$(date '+%Y-%m-%d %H:%M:%S')] $summary"
+        log "================================================================================"
+    else
+        run_one_job "$job" "${restic_args[@]}"
+        local rc=$?
+        if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+            overall=1
+        fi
+    fi
+    return "$overall"
+}
+
+# ---------------------------------------------------------------------------
+# completion & logrotate
+# ---------------------------------------------------------------------------
+COMPLETION_SCRIPT=$(cat <<'EOF'
+_backup_restic_completion() {
+    local cur prev words cword
+    _init_completion || return
+    COMPREPLY=($(compgen -W "$(backup-restic __complete "${COMP_WORDS[@]}")" -- "$cur"))
+}
+complete -F _backup_restic_completion backup-restic
+EOF
+)
+
+cmd_completion_print() {
+    echo "$COMPLETION_SCRIPT"
+}
+
+cmd_completion_install() {
+    local dest
+    if (( EUID == 0 )); then
+        dest="/etc/bash_completion.d/backup-restic"
+    else
+        dest="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/backup-restic"
+    fi
+    mkdir -p "$(dirname "$dest")"
+    echo "$COMPLETION_SCRIPT" > "$dest"
+    echo "Installed completion to $dest"
+    echo "Run 'source $dest' or start a new shell to use it."
+}
+
+LOGROTATE_SNIPPET=$(cat <<'EOF'
+/var/log/backup-restic/*.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+)
+
+cmd_logrotate_print() {
+    echo "$LOGROTATE_SNIPPET"
+}
+
+cmd_logrotate_install() {
+    require_root
+    local dest="/etc/logrotate.d/backup-restic"
+    mkdir -p "$(dirname "$dest")"
+    echo "$LOGROTATE_SNIPPET" > "$dest"
+    echo "Installed logrotate config to $dest"
+}
+
+# Hidden subcommand the installed completion function calls into.
+cmd_complete() {
+    local words=("$@")
+    local n="${#words[@]}"
+
+    if [ "$n" -le 2 ]; then
+        echo "ls config edit run forget prune check unlock init restore --completion --logrotate --help --version"
+        return
+    fi
+
+    local cmd="${words[1]}"
+    case "$cmd" in
+        ls)
+            if [ "$n" -eq 3 ] || [ "$n" -eq 4 ]; then
+                cmd_ls_jobs
+            fi
+            ;;
+        config|edit|forget|prune|unlock|init|check|restore)
+            [ "$n" -eq 3 ] && cmd_ls_jobs
+            case "$cmd" in
+                check)
+                    [ "$n" -ge 4 ] && echo "--read-data"
+                    ;;
+                forget)
+                    [ "$n" -ge 4 ] && echo "--prune"
+                    ;;
+                restore)
+                    [ "$n" -ge 5 ] && echo "--target"
+                    ;;
+            esac
+            ;;
+        run)
+            if [ "$n" -eq 3 ]; then
+                cmd_ls_jobs
+                echo "--all"
+            elif [ "$n" -ge 4 ]; then
+                echo "--dry-run --quiet -q"
+            fi
+            ;;
+        --completion|--logrotate)
+            [ "$n" -eq 3 ] && echo "install print"
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+main() {
+    case "${1:-}" in
+        --version|-v) echo "backup-restic $VERSION"; exit 0 ;;
+        --help|-h|help|"") usage; exit 0 ;;
+        __complete) shift; cmd_complete "$@"; exit 0 ;;
+        --completion)
+            shift
+            case "${1:-print}" in
+                print)   cmd_completion_print ;;
+                install) cmd_completion_install ;;
+                *) die "usage: backup-restic --completion [print|install]" ;;
+            esac
+            exit 0
+            ;;
+        --logrotate)
+            shift
+            case "${1:-print}" in
+                print)   cmd_logrotate_print ;;
+                install) cmd_logrotate_install ;;
+                *) die "usage: backup-restic --logrotate [print|install]" ;;
+            esac
+            exit 0
+            ;;
+    esac
+
+    local cmd="${1:-}"; shift || true
+
+    case "$cmd" in
+        ls)
+            load_global
+            if [ "$#" -eq 0 ]; then
+                cmd_ls
+            else
+                require_restic
+                cmd_ls "$@"
+            fi
+            ;;
+        config)
+            load_global
+            [ -n "${1:-}" ] || die "usage: backup-restic config JOB"
+            cmd_config "$1"
+            ;;
+        edit)
+            load_global
+            [ -n "${1:-}" ] || die "usage: backup-restic edit JOB"
+            cmd_edit "$1"
+            ;;
+        run|forget|prune|check|unlock|init|restore)
+            require_restic
+            load_global
+            case "$cmd" in
+                run)     [ -n "${1:-}" ] || die "usage: backup-restic run JOB|--all [restic args...]"; acquire_lock; cmd_run "$@" ;;
+                forget)  [ -n "${1:-}" ] || die "usage: backup-restic forget JOB [restic args...]"; acquire_lock; cmd_forget "$@" ;;
+                prune)   [ -n "${1:-}" ] || die "usage: backup-restic prune JOB [restic args...]"; acquire_lock; cmd_prune "$@" ;;
+                check)   [ -n "${1:-}" ] || die "usage: backup-restic check JOB [restic args...]"; cmd_check "$@" ;;
+                unlock)  [ -n "${1:-}" ] || die "usage: backup-restic unlock JOB [restic args...]"; acquire_lock; cmd_unlock "$@" ;;
+                init)    [ -n "${1:-}" ] || die "usage: backup-restic init JOB [restic args...]"; acquire_lock; cmd_init "$@" ;;
+                restore) [ "$#" -ge 2 ] || die "usage: backup-restic restore JOB SNAPSHOT [restic args...]"; acquire_lock; cmd_restore "$@" ;;
+            esac
+            ;;
+        *) echo "Unknown command: $cmd" >&2; usage; exit 1 ;;
+    esac
+}
+
+main "$@"

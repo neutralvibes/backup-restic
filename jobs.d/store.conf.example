@@ -1,0 +1,124 @@
+# ===========================================================================
+# backup-restic job configuration  (jobs.d/store.conf)
+# ===========================================================================
+#
+# The FILENAME sets the job name: this file creates a job called "store".
+# Job names may contain A-Z, a-z, 0-9, '.', '_' and '-'.
+#
+# This file is sourced AFTER backup-restic.conf, so anything set there
+# (the DEFAULT_* values) acts as a fallback; values here override them for
+# THIS job only.
+#
+# SECURITY:
+#   Like the global config, this file is trusted input. When backup-restic
+#   runs as root it must be owned by root and not writable by group or other
+#   users. Recommended: chown root:root store.conf && chmod 0640 store.conf
+
+# ---------------------------------------------------------------------------
+# Repository  (required: set REPO or REPO_NAME)
+# ---------------------------------------------------------------------------
+
+# Full restic repository location. Can be a local path or any restic URL
+# (sftp:user@host:/path, s3:..., rest:https://..., b2:..., etc.). If set, it
+# is used as-is and REPO_NAME is ignored. Relative local paths are anchored
+# to the config directory (with a loud warning) - prefer absolute paths.
+#REPO="/mnt/backups/restic/store"
+
+# Alternatively, name the repo and let it resolve to
+# $DEFAULT_REPO_BASE/$REPO_NAME. Use this OR REPO, not both. If neither is
+# set here, DEFAULT_REPO_NAME from the global config is used instead.
+# NOTE: requires DEFAULT_REPO_BASE to be set in backup-restic.conf.
+REPO_NAME="store"
+
+# File containing the restic password for THIS job's repo. If unset, falls
+# back to DEFAULT_PASSWORD_FILE from the global config. Must be readable by
+# the user running backup-restic (usually root), root-owned, chmod 0600.
+#PASSWORD_FILE="/etc/backup-restic/store-password"
+
+# ---------------------------------------------------------------------------
+# What to back up  (required)
+# ---------------------------------------------------------------------------
+
+# Paths to include in the backup. At least one is required; each must exist
+# at run time or the job fails preflight.
+PATHS=(
+    "/srv/data"
+    "/etc"
+)
+
+# Patterns to exclude, each passed to restic as --exclude. Supports restic's
+# pattern syntax (wildcards, leading / for anchored paths, etc.). Optional.
+#EXCLUDES=(
+#    "*.tmp"
+#    "*.cache"
+#    "lost+found"
+#)
+
+# ---------------------------------------------------------------------------
+# Retention & pruning
+# ---------------------------------------------------------------------------
+
+# Retention policy for this job, passed straight to `restic forget`. If
+# unset, uses DEFAULT_RETENTION from the global config.
+#RETENTION=(--keep-daily 7 --keep-weekly 4 --keep-monthly 6)
+
+# When the retention step runs during `backup-restic run`:
+#   after  - forget old snapshots after a successful backup
+#   before - forget old snapshots before the backup starts
+# If unset, uses DEFAULT_FORGET_WHEN.
+#FORGET_WHEN="after"
+
+# Whether retention during `run` also prunes (reclaims disk space). Pruning
+# is slow/expensive, so the default (from DEFAULT_FORGET_AUTO_PRUNE) is
+# false. Set true here to auto-prune just for this job, or leave it false and
+# reclaim space on your own schedule with `backup-restic prune store`.
+#FORGET_AUTO_PRUNE="false"
+
+# ---------------------------------------------------------------------------
+# Preflight & hooks
+# ---------------------------------------------------------------------------
+
+# A mountpoint that must be mounted before the backup runs (checked with
+# `mountpoint -q`). Useful when PATHS live on removable or network storage.
+# The job fails preflight if it is not mounted. Optional.
+#MOUNT_CHECK="/mnt/backups"
+
+# Executable run BEFORE the backup (e.g. mount a drive/share, freeze a DB,
+# snapshot a volume). Must be root-owned, non-group/world-writable, and
+# executable. What happens if it fails is controlled by BEFORE_BACKUP_FAILURE.
+# Optional.
+#BEFORE_BACKUP="/opt/backup-restic/hooks/store-pre.sh"
+
+# What to do if BEFORE_BACKUP fails:
+#   abort  - stop; do not run the backup (default, from DEFAULT_BEFORE_BACKUP_FAILURE)
+#   ignore - log a warning and carry on with the backup anyway
+#BEFORE_BACKUP_FAILURE="abort"
+
+# Executable run AFTER the backup, EVEN IF the backup failed (e.g. unfreeze,
+# unmount, cleanup). It receives the outcome via environment variables (see
+# bottom of this file). Must be root-owned and executable. Optional.
+#AFTER_BACKUP="/opt/backup-restic/hooks/store-post.sh"
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+
+# Override the global NOTIFY_METHOD for this job only:
+#   none | pushover | webhook
+#NOTIFY_METHOD_OVERRIDE="pushover"
+
+# Override the global NOTIFY_ON for this job only:
+#   failure | success | both
+#NOTIFY_ON_OVERRIDE="failure"
+
+# ---------------------------------------------------------------------------
+# Environment variables available to BEFORE_BACKUP / AFTER_BACKUP hooks
+# ---------------------------------------------------------------------------
+#   BACKUP_RESTIC_JOB       job name (e.g. "store")
+#   BACKUP_RESTIC_MODE      "BACKUP" or "DRY RUN"
+#   BACKUP_RESTIC_DRY_RUN   "1" if a dry run, else "0"
+#   BACKUP_RESTIC_PHASE     "before" or "after"
+#   BACKUP_RESTIC_STATUS    "success" or "failure" (in the after-hook, the
+#                           outcome reached so far)
+#   BACKUP_RESTIC_REASON    failure category on failure, e.g. "backup",
+#                           "before_hook", "after_hook" (empty on success)

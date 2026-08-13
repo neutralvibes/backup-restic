@@ -1,0 +1,39 @@
+{
+  "name": "backup-restic",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "initializeCommand": "mkdir -p ${localWorkspaceFolder}/.private-config/.vscode-server",
+  "runArgs": [
+    "--name",
+    "${localWorkspaceFolderBasename}_devcontainer"
+  ],
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y e2fsprogs",
+  "features": {
+    "ghcr.io/devcontainers-extra/features/shellcheck:1": {},
+    "ghcr.io/szkiba/devcontainer-features/bats:1": {},
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": true,
+      "configureZshAsDefaultShell": false
+    },
+    "ghcr.io/devcontainers/features/git:1": {
+      "gpgSign": true
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "saoudrizwan.claude-dev"
+      ],
+      "settings": {
+        "editor.formatOnSave": true
+      }
+    }
+  },
+  "mounts": [
+    "source=${localEnv:HOME}/.gitconfig,target=/home/vscode/.gitconfig,type=bind",
+    "source=${localEnv:HOME}/.gnupg,target=/home/vscode/.gnupg,type=bind",
+    "source=${localEnv:HOME}/bin,target=/home/vscode/bin,type=bind",
+    "source=${localEnv:HOME}/projects/.cline,target=/home/vscode/.cline,type=bind",
+    "source=${localWorkspaceFolder}/.private-config/.vscode-server,target=/home/vscode/.vscode-server,type=bind"
+  ],
+  "remoteUser": "vscode"
+}
