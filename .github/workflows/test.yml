@@ -38,7 +38,7 @@ jobs:
       - name: Install bats and dependencies
         run: |
           apt-get update
-          apt-get install -y bats e2fsprogs
+          apt-get install -y bats e2fsprogs shellcheck
 
       - name: Run tests as root
         run: |
