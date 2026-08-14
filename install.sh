@@ -100,6 +100,24 @@ cp -f "$SRC_DIR/backup-restic" "$INSTALL_DIR/backup-restic" ||
 chmod 0755 "$INSTALL_DIR/backup-restic"
 info "installed $INSTALL_DIR/backup-restic"
 
+
+SCRIPT_LEVEL_FILES=(
+    "backup-restic.conf"
+    "backup-restic.conf.example"
+    )
+
+install_script_level_files() {
+    local filename
+    for filename in "${SCRIPT_LEVEL_FILES[@]}"; do
+        if [ -f "$SRC_DIR/${filename}" ]; then
+            cp -f "$SRC_DIR/${filename}" "$INSTALL_DIR" ||
+                die "cannot install ${filename}"
+            chmod 0640 "$INSTALL_DIR/${filename}"
+            info "installed $INSTALL_DIR/$filename"
+        fi
+    done
+}
+
 # ---------------------------------------------------------------------------
 # Templates (.example files)
 # ---------------------------------------------------------------------------
@@ -129,13 +147,7 @@ install_dir_contents() {
     done
 }
 
-# Global config template. The real backup-restic.conf is never touched here.
-if [ -f "$SRC_DIR/backup-restic.conf.example" ]; then
-    cp -f "$SRC_DIR/backup-restic.conf.example" "$INSTALL_DIR/backup-restic.conf.example" ||
-        die "cannot install global config template"
-    chmod 0640 "$INSTALL_DIR/backup-restic.conf.example"
-    info "installed $INSTALL_DIR/backup-restic.conf.example"
-fi
+install_script_level_files
 
 install_dir_contents "$SRC_DIR/jobs.d" "$INSTALL_DIR/jobs.d"
 install_dir_contents "$SRC_DIR/hooks"  "$INSTALL_DIR/hooks"

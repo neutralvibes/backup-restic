@@ -4,3 +4,4 @@
 .private
 .private-config
 .scripts
+jobs.d/test.conf

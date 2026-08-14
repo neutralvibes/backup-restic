@@ -55,6 +55,14 @@ PATHS=(
 #)
 
 # ---------------------------------------------------------------------------
+# Extra parameters for backup command (optional)
+# ---------------------------------------------------------------------------
+
+# This must be entered a bash array. Each extra argument will be passed automatically
+# to the restic backup command to save entering them manually.
+#BACKUP_EXTRA_ARGS=()
+
+# ---------------------------------------------------------------------------
 # Retention & pruning
 # ---------------------------------------------------------------------------
 

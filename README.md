@@ -4,27 +4,32 @@ A **job-based wrapper around [restic](https://restic.net/)** that turns per-repo
 backup chores into declarative, self-contained jobs — with security validation,
 hooks, notifications, retention/prune control, and logging built in.
 
-> **Status:** please test restores before trusting it with data you
+> **Important:** Please test restores before trusting it with data you
 > can't afford to lose.
 
 ---
 
-## Why?
+## Why backup-restic?
 
 `restic` is excellent, but running it by hand means remembering a repository path,
 a password file, tags, retention flags, and the right sequence of commands for
-*every* repository. `backup-restic` collapses all of that into named jobs:
+*every* repository. `backup-restic` collapses all of that into named jobs each with their own configurations:
 
 ```bash
-backup-restic run pve        # back up using the "pve" job definition
-backup-restic run --all      # back up everything
+# back up using the "pve" job definition
+backup-restic run pve
+
+# back up using all created jobs
+backup-restic run --all
+
+# Restore pve snapshot a1b2c3d4 to /tmp/restore-test
 backup-restic restore pve a1b2c3d4 --target /tmp/restore-test
 ```
 
 Each job is a single config file describing **what** to back up, **where** it goes,
-**how long** to keep it, and **what to do** before/after. The wrapper handles the rest — safely.
+**how long** to keep it, and **what to do** before/after, along with any **any extra arguments** to pass to the restic command. The wrapper handles the rest safely.
 
-> **Note:** `restic` must be installed on your system to use this wrapper.
+> **Note:** `restic` must be installed on your system to use this wrapper. You need to have an understanding of restic before using this utility.
 
 ### Highlights
 
@@ -82,22 +87,22 @@ Targets Linux. It is not intended to be POSIX-portable or to run on macOS/BSD.
 
 ## How it works
 
-- A **job** is a config file at `jobs.d/<job>.conf`. The filename is the job name.
+- A **job** is a config file located in the `jobs.d/` folder. Each job files extension is `.conf`
 - Each job's snapshots are tagged with the job name, so one repository can hold
-  many jobs, or each job can have its own repository.
+  many jobs, or each job can have its own repository as you chose.
 - `backup-restic` resolves the job's repo + password, then drives `restic backup`,
   `restic forget`, and (optionally) `restic prune` for you.
-- Config lives **alongside the script**. Symlinks are followed, so you can keep
-  everything in `/opt/backup-restic/` and symlink the binary into your `PATH`.
+- Config lives **alongside the script**.
 
 ---
 
 ## Installation
 
-`backup-restic` is installed directly from its source repository using the included
-`install.sh` script. The installer automatically detects your privileges: running it
-as `root` performs a system-wide installation, while running it as a standard user
-performs a local, user-scoped installation.
+`backup-restic` is installed directly using the included
+`install.sh` script. The installer automatically detects your privileges.
+
+* Installing as `root` performs a system-wide installation.
+* Install as non-root account performs a local, user-scoped installation.
 
 **Installer guarantees:**
 * **Non-interactive:** Safe to use in automated scripts and CI/CD pipelines.
@@ -163,11 +168,13 @@ sudo ./install.sh  # or `./install.sh`
 
 ### Verify and Next Steps
 
-Verify the installation by checking the version:
+Verify the installation by checking the configuration:
 
 ```bash
-backup-restic --version
+backup-restic config
 ```
+
+This will show the version along with file locations and default settings
 
 > **Note on Bash Completion:** The installer configures tab completion automatically.
 > Open a new terminal session or run `source ~/.bashrc` (or equivalent) to enable it.
@@ -179,14 +186,17 @@ first backup job.
 
 ## Quick start
 
-A minimal, working setup in five steps. *(Assumes a system-wide installation).*
+A minimal, working setup in five steps. *(Assumes a root system-wide installation).*
 
-**1. Create a password file** (one line, root-only):
+**1. Create a `restic` password file or use an existing one**:
 
 ```bash
 sudo mkdir -p /etc/backup-restic
+
 sudo sh -c 'umask 077; head -c 32 /dev/urandom | base64 > /etc/backup-restic/restic-password'
 ```
+
+**Remember** to *always* take a copy of the password file content save it somewhere securely.
 
 **2. Write the global config** at `/opt/backup-restic/backup-restic.conf`:
 
@@ -235,6 +245,8 @@ Lives at `backup-restic.conf` next to the script. Sets defaults for every job.
 | `DEFAULT_REPO_BASE`             | *(empty)*                                         | Base directory for repos resolved via `REPO_NAME`.                     |
 | `DEFAULT_REPO_NAME`             | *(empty)*                                         | Shared repo name used when a job sets neither `REPO` nor `REPO_NAME`.  |
 | `DEFAULT_RETENTION`             | `--keep-daily 7 --keep-weekly 4 --keep-monthly 6` | Default retention flags passed to `restic forget`.                     |
+| `DEFAULT_BACKUP_EXTRA_ARGS`     | *(empty array)*                                   | Array of extra args for backup: e.g. `DEFAULT_BACKUP_EXTRA_ARGS=(--one-file-system --exclude-if-present .nobackup)`.                                       |
+
 | `LOG_DIR`                       | `/var/log/backup-restic`                          | Directory for per-job log files.                                       |
 | `DEFAULT_FORGET_WHEN`           | `after`                                           | When retention runs during `run` (`after` \| `before`).                |
 | `DEFAULT_FORGET_AUTO_PRUNE`     | `false`                                           | Whether retention during `run` also prunes.                            |
@@ -298,7 +310,7 @@ reset between jobs so a `run --all` never leaks one job's settings into another.
 | `ls JOB`                             | List snapshots for a job                                      |
 | `ls JOB SNAPSHOT`                    | List files in a snapshot                                      |
 | `config JOB`                         | Show a job's fully resolved config                            |
-| `edit JOB`                           | Open a job's config in `$EDITOR` (default `nano`)             |
+| `edit-job JOB`                           | Open a job's config in `$EDITOR` (default `nano`)             |
 | `run JOB\|--all [restic args]`       | Backup + retention. Supports `-q/--quiet`, `--dry-run`.       |
 | `forget JOB [restic args]`           | Apply retention policy only (no prune unless `--prune` given) |
 | `prune JOB [restic args]`            | Prune the repo to reclaim space (expensive)                   |

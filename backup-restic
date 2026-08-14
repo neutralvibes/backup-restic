@@ -3,14 +3,29 @@
 #
 # Requires bash >= 4.4 (relies on empty-array expansion "${arr[@]}" under `set -u`).
 set -uo pipefail
-VERSION="0.3.1"
+export LC_ALL=C
+VERSION="0.3.2"
 
 # --- LOCATIONS ---
 # Resolve the script's real directory even when invoked via a symlink
 # (e.g. /usr/local/bin/backup-restic -> /opt/backup-restic/backup-restic),
 # so the script, its config, and its jobs.d all live together under one directory.
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-CONFIG_DIR="${BACKUP_RESTIC_CONFIG_DIR:-$SCRIPT_DIR}"
+
+# When running as root, ignore BACKUP_RESTIC_CONFIG_DIR to prevent environment
+# variable injection (via sudo SETENV, env_keep, sudo -E, or CI/CD pipelines)
+# from redirecting root's file writes to arbitrary locations.
+if (( EUID == 0 )); then
+    CONFIG_DIR="$SCRIPT_DIR"
+elif [ -n "${BACKUP_RESTIC_CONFIG_DIR:-}" ]; then
+    CONFIG_DIR="$(cd "${BACKUP_RESTIC_CONFIG_DIR}" 2>/dev/null && pwd)" || {
+        echo "ERROR: BACKUP_RESTIC_CONFIG_DIR '${BACKUP_RESTIC_CONFIG_DIR}' is not an accessible directory" >&2
+        exit 1
+    }
+else
+    CONFIG_DIR="$SCRIPT_DIR"
+fi
+
 GLOBAL_CONF="${CONFIG_DIR}/backup-restic.conf"
 JOBS_DIR="${CONFIG_DIR}/jobs.d"
 
@@ -19,6 +34,7 @@ DEFAULT_PASSWORD_FILE=""
 DEFAULT_REPO_NAME=""
 DEFAULT_REPO_BASE=""
 DEFAULT_RETENTION=(--keep-daily 7 --keep-weekly 4 --keep-monthly 6)
+DEFAULT_BACKUP_EXTRA_ARGS=()
 DEFAULT_FORGET_WHEN="after"                 # after | before
 DEFAULT_FORGET_AUTO_PRUNE="false"           # true | false
 DEFAULT_BEFORE_BACKUP_FAILURE="abort"       # abort | ignore
@@ -52,10 +68,18 @@ require_root() {
     (( EUID == 0 )) || die "must be run as root"
 }
 
+redact() {
+    if [ -n "${1:-}" ]; then
+        echo "(set)"
+    else
+        echo "(not set)"
+    fi
+}
+
 validate_trusted_file() {
     local file="$1"
     local label="${2:-file}"
-    local owner owner_name mode dir
+    local owner owner_name mode dir cwd
 
     [ -f "$file" ] || die "$label '$file' is not a regular file"
     [ ! -L "$file" ] || die "$label '$file' must not be a symlink"
@@ -79,6 +103,20 @@ validate_trusted_file() {
         die "$label '$file' is not readable by the current user; check its ownership and permissions"
 
     dir="$(dirname "$file")"
+
+    # If the caller supplied a relative path, dirname can produce '.', and
+    # dirname '.' is '.', causing an infinite loop. Anchor the traversal to
+    # the current directory without resolving symlinks, so absolute-path
+    # callers see no change and relative-path callers get a finite traversal.
+    if [[ "$dir" != /* ]]; then
+        cwd="${PWD:-$(pwd)}" || die "cannot determine current directory"
+        if [[ "$cwd" == "/" ]]; then
+            dir="/$dir"
+        else
+            dir="$cwd/$dir"
+        fi
+    fi
+
     while [ "$dir" != "/" ]; do
         mode="$(stat -c '%a' "$dir")" || die "cannot inspect directory '$dir'"
         if (( (8#$mode & 022) != 0 )) && (( (8#$mode & 01000) == 0 )); then
@@ -136,30 +174,36 @@ usage() {
 backup-restic - job-based wrapper around restic
 
 USAGE:
-  backup-restic ls                              List configured jobs
+  backup-restic ls                               List configured jobs
   backup-restic ls JOB [restic args...]          List snapshots for a job
   backup-restic ls JOB SNAPSHOT [restic args...] List files in a snapshot
+  backup-restic config                           Show locations and global settings
+  backup-restic config [--global]                Same as plain 'config'
   backup-restic config JOB                       Show a job's fully resolved config
-  backup-restic edit JOB                         Open a job's config file in $EDITOR (default: nano)
-  backup-restic run JOB [restic args...]        Run a backup job (backup + retention)
-  backup-restic run --all [restic args...]      Run every configured job
-                                                -q/--quiet: log to file only, not stdout
+  backup-restic create-job JOB                   Create a new job config file in jobs.d/
+  backup-restic edit-job JOB                     Edit a job's config file in $EDITOR (default: nano)
+                                                 Must already exist.
+  backup-restic run JOB [restic args...]         Run a backup job (backup + retention)
+  backup-restic run --all [restic args...]       Run every configured job
+                                                 -q/--quiet: log to file only, not stdout
   backup-restic forget JOB [restic args...]      Apply retention policy only (cheap; no prune)
   backup-restic prune JOB [restic args...]       Prune repo to reclaim space (expensive)
-  backup-restic check JOB [restic args...]      Check repo integrity
+  backup-restic check JOB [restic args...]       Check repo integrity
   backup-restic unlock JOB [restic args...]      Remove stale locks
-  backup-restic init JOB [restic args...]      Initialise a job's repo
+  backup-restic init JOB [restic args...]        Initialise a job's repo
   backup-restic restore JOB SNAPSHOT [restic args...]
-                                               Restore a snapshot to DIR
-  backup-restic --completion [print|install]    Bash completion (default: print)
-  backup-restic --logrotate [print|install]     Logrotate config (default: print)
-  backup-restic --version                       Print version
-  backup-restic --help                          This message
+                                                Restore a snapshot to DIR
+  backup-restic --completion [print|install]     Bash completion (default: print)
+  backup-restic --logrotate [print|install]      Logrotate config (default: print)
+  backup-restic --version                        Print version
+  backup-restic --help                           This message
 
 EXAMPLES:
+  backup-restic config
   backup-restic ls
+  backup-restic create-job pve
   backup-restic config pve
-  backup-restic edit pve
+  backup-restic edit-job pve
   backup-restic ls pve latest
   backup-restic run pve
   backup-restic run --all
@@ -228,15 +272,22 @@ load_global() {
         validate_trusted_file "$GLOBAL_CONF" "global config"
         # shellcheck disable=SC1090  # dynamic path, validated above
         source "$GLOBAL_CONF" || die "failed to load global config '$GLOBAL_CONF'; check that it is readable and valid"
+
+        if ! declare -p DEFAULT_BACKUP_EXTRA_ARGS 2>/dev/null | grep -q 'declare -a'; then
+            die "DEFAULT_BACKUP_EXTRA_ARGS in '$GLOBAL_CONF' must be a bash array, e.g. DEFAULT_BACKUP_EXTRA_ARGS=(--one-file-system)"
+        fi
     fi
 }
 
 # Load a job's config, resetting job-scoped vars first so jobs never leak
 # settings into each other when running --all in one process.
-load_job() {
+# Load a job's config file and set up all variables.
+# Does NOT validate that required fields are present or that values are valid.
+# Call validate_job_ready() after this to enforce completeness.
+load_job_config() {
     local job="$1"
-    [[ "$job" =~ ^[A-Za-z0-9._-]+$ ]] ||
-        die "invalid job name '$job' (use only A-Z, a-z, 0-9, '.', '_' and '-')"
+    [[ "$job" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+        die "invalid job name '$job' (must start with A-Z, a-z, or 0-9; may also contain '.', '_' and '-')"
     local job_conf="${JOBS_DIR}/${job}.conf"
     [ -f "$job_conf" ] || die "no such job: $job (expected $job_conf)"
 
@@ -246,6 +297,7 @@ load_job() {
     PATHS=()
     EXCLUDES=()
     RETENTION=("${DEFAULT_RETENTION[@]}")
+    BACKUP_EXTRA_ARGS=("${DEFAULT_BACKUP_EXTRA_ARGS[@]}")
     MOUNT_CHECK=""
     BEFORE_BACKUP=""
     AFTER_BACKUP=""
@@ -261,15 +313,62 @@ load_job() {
     # shellcheck disable=SC1090  # dynamic path, validated above
     source "$job_conf" || die "failed to load job config '$job_conf'; check that it is readable and valid"
 
+    if ! declare -p BACKUP_EXTRA_ARGS 2>/dev/null | grep -q 'declare -a'; then
+        die "BACKUP_EXTRA_ARGS in '$job_conf' must be a bash array, e.g. BACKUP_EXTRA_ARGS=(--one-file-system --ignore-inode)"
+    fi
+
     [ -n "$NOTIFY_METHOD_OVERRIDE" ] && JOB_NOTIFY_METHOD="$NOTIFY_METHOD_OVERRIDE"
     [ -n "$NOTIFY_ON_OVERRIDE" ] && JOB_NOTIFY_ON="$NOTIFY_ON_OVERRIDE"
+
+    # Attempt REPO resolution without dying on failure.
+    if [ -z "$REPO" ]; then
+        local repo_name="$REPO_NAME"
+        [ -n "$repo_name" ] || repo_name="$DEFAULT_REPO_NAME"
+        if [ -n "$repo_name" ] && [ -n "$DEFAULT_REPO_BASE" ]; then
+            REPO="${DEFAULT_REPO_BASE}/${repo_name}"
+        fi
+    fi
+
+    JOB_NAME="$job"
+    LOG_FILE="${LOG_DIR}/${job}.log"
+}
+
+# Validate that a loaded job config has all required fields and valid values.
+# Must be called after load_job_config(). Dies with a comprehensive error
+# listing ALL missing/invalid fields if the job is not ready to run.
+validate_job_ready() {
+    local job="$1"
+    local -a config_errors=()
 
     if [ -z "$REPO" ]; then
         local repo_name="$REPO_NAME"
         [ -n "$repo_name" ] || repo_name="$DEFAULT_REPO_NAME"
-        [ -n "$repo_name" ] || die "job '$job': set REPO or REPO_NAME in $job_conf, or set DEFAULT_REPO_NAME in global config for a shared repo"
-        [ -n "$DEFAULT_REPO_BASE" ] || die "job '$job': repo name '$repo_name' set but no DEFAULT_REPO_BASE in global config"
-        REPO="${DEFAULT_REPO_BASE}/${repo_name}"
+        if [ -z "$repo_name" ]; then
+            config_errors+=("REPO or REPO_NAME is not set (and no DEFAULT_REPO_NAME in global config)")
+        elif [ -z "$DEFAULT_REPO_BASE" ]; then
+            config_errors+=("REPO_NAME='$repo_name' is set but DEFAULT_REPO_BASE is missing from global config")
+        fi
+    fi
+
+    if [ -z "$PASSWORD_FILE" ]; then
+        config_errors+=("PASSWORD_FILE is not set (and no DEFAULT_PASSWORD_FILE in global config)")
+    fi
+
+    if [ "${#PATHS[@]}" -eq 0 ]; then
+        config_errors+=("PATHS is empty - add at least one source path to back up")
+    fi
+
+    if [ "${#config_errors[@]}" -gt 0 ]; then
+        local err msg
+        msg="job '$job' is not fully configured:"
+        for err in "${config_errors[@]}"; do
+            msg="${msg}
+  - ${err}"
+        done
+        msg="${msg}
+
+Fix these in the job config: backup-restic edit-job $job"
+        die "$msg"
     fi
 
     # A bare relative local path (no leading / and no scheme like sftp:/s3:)
@@ -281,10 +380,7 @@ load_job() {
         REPO="$resolved_repo"
     fi
 
-    [ -n "$PASSWORD_FILE" ] || die "job '$job': no password file (set PASSWORD_FILE or DEFAULT_PASSWORD_FILE)"
     validate_trusted_file "$PASSWORD_FILE" "password file"
-
-    [ "${#PATHS[@]}" -gt 0 ] || die "job '$job': PATHS is empty in $job_conf"
 
     case "$FORGET_WHEN" in
         after|before) ;;
@@ -303,9 +399,13 @@ load_job() {
 
     export RESTIC_REPOSITORY="$REPO"
     export RESTIC_PASSWORD_FILE="$PASSWORD_FILE"
-    JOB_NAME="$job"
-    LOG_FILE="${LOG_DIR}/${job}.log"
     ensure_log_path
+}
+
+# Combined loader: load + validate. Used by run, forget, prune, check, etc.
+load_job() {
+    load_job_config "$1"
+    validate_job_ready "$1"
 }
 
 log() {
@@ -467,15 +567,108 @@ cmd_ls_jobs() {
     [ "$found" -eq 1 ] || echo "(no jobs configured in $JOBS_DIR)"
 }
 
+cmd_config_global() {
+    local f job_count=0
+    local -a job_names=()
+
+    if [ -d "$JOBS_DIR" ]; then
+        for f in "$JOBS_DIR"/*.conf; do
+            [ -e "$f" ] || continue
+            job_count=$((job_count + 1))
+            if [ "${#job_names[@]}" -lt 8 ]; then
+                job_names+=("$(basename "$f" .conf)")
+            fi
+        done
+    fi
+
+    local jobs_summary
+    if [ "$job_count" -eq 0 ]; then
+        jobs_summary="0 jobs"
+    elif [ "$job_count" -le 8 ]; then
+        jobs_summary="$job_count job(s): ${job_names[*]}"
+    else
+        jobs_summary="$job_count job(s)"
+    fi
+
+    local restic_info="not installed"
+    if command -v restic >/dev/null 2>&1; then
+        local restic_path restic_version
+        restic_path="$(command -v restic)"
+        restic_version="$(restic version 2>/dev/null | awk '{print $2}')"
+        if [ -n "$restic_version" ]; then
+            restic_info="$restic_path ($restic_version)"
+        else
+            restic_info="$restic_path (version unknown)"
+        fi
+    fi
+
+    local global_status="not found - optional"
+    [ -f "$GLOBAL_CONF" ] && global_status="loaded"
+
+    local log_status
+    if [ -d "$LOG_DIR" ]; then
+        log_status="found"
+    else
+        log_status="missing - will be created when needed"
+    fi
+
+    local config_dir_note=""
+    if (( EUID == 0 )) && [ -n "${BACKUP_RESTIC_CONFIG_DIR:-}" ]; then
+        config_dir_note=" (ignored when running as root)"
+    fi
+
+    cat <<EOF
+backup-restic $VERSION
+
+Locations:
+  Script directory:      $SCRIPT_DIR
+  Config directory:      $CONFIG_DIR
+  Global config:         $GLOBAL_CONF [$global_status]
+  Jobs directory:        $JOBS_DIR [$jobs_summary]
+  Log directory:         $LOG_DIR [$log_status]
+  Lock file:             $LOG_DIR/.backup-restic.lock
+  Restic:                $restic_info
+
+Environment:
+  BACKUP_RESTIC_CONFIG_DIR: ${BACKUP_RESTIC_CONFIG_DIR:-(not set)}${config_dir_note}
+  EDITOR:                   ${EDITOR:-(not set; edit defaults to nano)}
+  XDG_STATE_HOME:           ${XDG_STATE_HOME:-(not set)}
+
+Global settings:
+  Default repo base:       ${DEFAULT_REPO_BASE:-(none)}
+  Default repo name:       ${DEFAULT_REPO_NAME:-(none)}
+  Default password file:   ${DEFAULT_PASSWORD_FILE:-(none)}
+  Default retention:       ${DEFAULT_RETENTION[*]:-(none)}
+  Default backup extra:    ${DEFAULT_BACKUP_EXTRA_ARGS[*]:-(none)}
+  Forget when:             $DEFAULT_FORGET_WHEN
+  Forget auto prune:       $DEFAULT_FORGET_AUTO_PRUNE
+  Before-hook failure:     $DEFAULT_BEFORE_BACKUP_FAILURE
+
+Notifications:
+  Notify method:           $NOTIFY_METHOD
+  Notify on:               $NOTIFY_ON
+  Notify credentials file: ${NOTIFY_CREDENTIALS_FILE:-(none)}
+  Pushover token:          $(redact "${PUSHOVER_TOKEN:-}")
+  Pushover user:           $(redact "${PUSHOVER_USER:-}")
+  Webhook URL:             $(redact "${WEBHOOK_URL:-}")
+EOF
+}
+
 cmd_config() {
     local job="$1"
-    load_job "$job"
+    load_job_config "$job"
+
+    local repo_display="${REPO:-(not configured)}"
+    local password_display="${PASSWORD_FILE:-(not configured)}"
+    local paths_display="${PATHS[*]:-(not configured)}"
+
     cat <<EOF
 Job:             $JOB_NAME
-Repo:            $RESTIC_REPOSITORY
-Password file:   $RESTIC_PASSWORD_FILE
-Paths:           ${PATHS[*]}
+Repo:            $repo_display
+Password file:   $password_display
+Paths:           $paths_display
 Excludes:        ${EXCLUDES[*]:-(none)}
+Backup Extra:    ${BACKUP_EXTRA_ARGS[*]:-(none)}
 Retention:       ${RETENTION[*]}
 Forget runs:     $FORGET_WHEN backup
 Auto prune:      $FORGET_AUTO_PRUNE
@@ -487,9 +680,104 @@ Notify method:   $JOB_NOTIFY_METHOD
 Notify on:       $JOB_NOTIFY_ON
 Log file:        $LOG_FILE
 EOF
+
+    # Collect and display missing required fields
+    local -a missing=()
+    if [ -z "$REPO" ]; then
+        local repo_name="$REPO_NAME"
+        [ -n "$repo_name" ] || repo_name="$DEFAULT_REPO_NAME"
+        if [ -z "$repo_name" ]; then
+            missing+=("REPO or REPO_NAME (no DEFAULT_REPO_NAME in global config)")
+        elif [ -z "$DEFAULT_REPO_BASE" ]; then
+            missing+=("DEFAULT_REPO_BASE in global config (REPO_NAME='$repo_name' is set)")
+        fi
+    fi
+    [ -z "$PASSWORD_FILE" ] && missing+=("PASSWORD_FILE (no DEFAULT_PASSWORD_FILE in global config)")
+    [ "${#PATHS[@]}" -eq 0 ] && missing+=("PATHS (at least one source path)")
+
+    if [ "${#missing[@]}" -gt 0 ]; then
+        echo ""
+        echo "WARNING: job is not fully configured. Missing required:"
+        local m
+        for m in "${missing[@]}"; do
+            echo "  - $m"
+        done
+        echo ""
+        echo "Fix with: backup-restic edit-job $job"
+    fi
 }
 
-cmd_edit() {
+cmd_create_job() {
+    local job="$1"
+    [[ "$job" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+        die "invalid job name '$job' (must start with A-Z, a-z, or 0-9; may also contain '.', '_' and '-')"
+
+    local job_conf="${JOBS_DIR}/${job}.conf"
+
+    # Prevent symlink attacks on the jobs directory
+    if [ -e "$JOBS_DIR" ] || [ -L "$JOBS_DIR" ]; then
+        [ -d "$JOBS_DIR" ] || die "jobs directory '$JOBS_DIR' exists but is not a directory"
+        [ ! -L "$JOBS_DIR" ] || die "jobs directory '$JOBS_DIR' is a symlink; refusing to use it"
+    fi
+
+    # Check for both existence AND broken symlinks to prevent TOCTOU attacks
+    if [ -e "$job_conf" ] || [ -L "$job_conf" ]; then
+        die "job '$job' already exists or target is a symlink ($job_conf)"
+    fi
+
+    # Ensure the jobs directory exists with secure permissions
+    if [ ! -d "$JOBS_DIR" ]; then
+        (umask 077 && mkdir -p "$JOBS_DIR") || die "cannot create jobs directory '$JOBS_DIR'"
+    fi
+
+    # Create the file with restrictive permissions atomically via subshell
+    # umask, preventing a race condition where the file is briefly
+    # world-readable before a separate chmod could run.
+    (
+        umask 077
+        cat > "$job_conf" <<EOF
+# Configuration for job: $job
+#
+# For a full list of options, see the global config or documentation.
+# Most settings default to the global config if omitted here.
+
+# REPO=""
+# REPO_NAME=""
+
+PATHS=(
+    # "/path/to/data"
+)
+
+# EXCLUDES=(
+#     "*.tmp"
+# )
+
+# RETENTION=(--keep-daily 7 --keep-weekly 4 --keep-monthly 6)
+
+# BACKUP_EXTRA_ARGS=(
+#     # "--one-file-system"
+# )
+
+# BEFORE_BACKUP=""
+# AFTER_BACKUP=""
+EOF
+    ) || die "failed to create job configuration '$job_conf'"
+
+    echo "Created job configuration: $job_conf"
+    echo ""
+    echo "Next steps:"
+    echo ""
+    echo "  1. Edit the file to configure paths and settings:"
+    echo "       backup-restic edit-job $job"
+    echo ""
+    echo "  2. Initialize the repository:"
+    echo "       backup-restic init $job"
+    echo ""
+    echo "  3. Run a backup:"
+    echo "       backup-restic run $job"
+}
+
+cmd_edit_job() {
     local job="$1"
     local job_conf="${JOBS_DIR}/${job}.conf"
     [ -f "$job_conf" ] || die "no such job: $job (expected $job_conf)"
@@ -655,7 +943,7 @@ run_backup() {
         [ -n "$e" ] && exclude_args+=(--exclude "$e")
     done
 
-    local -a backup_cmd=(restic backup --tag "$job" "${exclude_args[@]}" "${restic_args[@]}" "${PATHS[@]}")
+    local -a backup_cmd=(restic backup --tag "$job" "${exclude_args[@]}" "${BACKUP_EXTRA_ARGS[@]}" "${restic_args[@]}" "${PATHS[@]}")
     local backup_status=0
     if [ -n "$DRYRUN_TEMP_REPO" ]; then
         RESTIC_REPOSITORY="$DRYRUN_TEMP_REPO" run_logged "${backup_cmd[@]}" || backup_status=$?
@@ -904,7 +1192,7 @@ cmd_run() {
         else
             all_result="COMPLETED"
         fi
-        
+
         local summary
         summary="ALL JOBS $all_result | elapsed $(format_elapsed "$all_elapsed")"
 
@@ -985,7 +1273,7 @@ cmd_complete() {
     local n="${#words[@]}"
 
     if [ "$n" -le 2 ]; then
-        echo "ls config edit run forget prune check unlock init restore --completion --logrotate --help --version"
+        echo "ls config edit-job create-job run forget prune check unlock init restore --completion --logrotate --help --version"
         return
     fi
 
@@ -996,7 +1284,13 @@ cmd_complete() {
                 cmd_ls_jobs
             fi
             ;;
-        config|edit|forget|prune|unlock|init|check|restore)
+        config)
+            if [ "$n" -eq 3 ]; then
+                cmd_ls_jobs
+                echo "--global"
+            fi
+            ;;
+        edit-job|forget|prune|unlock|init|check|restore)
             [ "$n" -eq 3 ] && cmd_ls_jobs
             case "$cmd" in
                 check)
@@ -1066,13 +1360,25 @@ main() {
             ;;
         config)
             load_global
-            [ -n "${1:-}" ] || die "usage: backup-restic config JOB"
-            cmd_config "$1"
+            if [ "$#" -eq 0 ]; then
+                cmd_config_global
+            elif [ "${1:-}" = "--global" ]; then
+                [ "$#" -eq 1 ] || die "usage: backup-restic config [--global|JOB]"
+                cmd_config_global
+            else
+                cmd_config "$1"
+            fi
             ;;
-        edit)
+        create-job)
             load_global
-            [ -n "${1:-}" ] || die "usage: backup-restic edit JOB"
-            cmd_edit "$1"
+            [ -n "${1:-}" ] || die "usage: backup-restic create-job JOB"
+            acquire_lock
+            cmd_create_job "$1"
+            ;;
+        edit-job)
+            load_global
+            [ -n "${1:-}" ] || die "usage: backup-restic edit-job JOB"
+            cmd_edit_job "$1"
             ;;
         run|forget|prune|check|unlock|init|restore)
             require_restic
