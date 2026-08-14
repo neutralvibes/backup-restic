@@ -329,6 +329,14 @@ load_job_config() {
         fi
     fi
 
+    # Anchor relative local paths to CONFIG_DIR so display and runtime
+    # both see a deterministic path.
+    if [ -n "$REPO" ] && [[ "$REPO" != /* ]] && [[ ! "$REPO" =~ ^[A-Za-z][A-Za-z0-9+.-]*: ]]; then
+        local resolved_repo="${CONFIG_DIR}/${REPO}"
+        echo "WARNING: job '$job' repo '$REPO' is a relative path - resolved to '$resolved_repo' (anchored to $CONFIG_DIR, not your current directory). Use an absolute path to avoid this warning." >&2
+        REPO="$resolved_repo"
+    fi
+
     JOB_NAME="$job"
     LOG_FILE="${LOG_DIR}/${job}.log"
 }
@@ -657,6 +665,11 @@ EOF
 cmd_config() {
     local job="$1"
     load_job_config "$job"
+
+    # Security checks still apply even when just viewing the config.
+    if [ -n "$PASSWORD_FILE" ]; then
+        validate_trusted_file "$PASSWORD_FILE" "password file"
+    fi
 
     local repo_display="${REPO:-(not configured)}"
     local password_display="${PASSWORD_FILE:-(not configured)}"

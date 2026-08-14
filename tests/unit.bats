@@ -109,7 +109,7 @@ EOF
   [[ "$output" == *"Retention:"*"--keep-daily 1"* ]]
 }
 
-@test "missing password file causes error" {
+@test "missing password file is shown in config" {
   cat > "$TEST_CONFIG_DIR/backup-restic.conf" <<EOF
 LOG_DIR="$TEST_LOG_DIR"
 DEFAULT_REPO_BASE="$TEST_CONFIG_DIR/repos"
@@ -119,11 +119,12 @@ EOF
   create_job "test"
 
   run "$BACKUP_RESTIC_SCRIPT" config test
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"password file"* ]]
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PASSWORD_FILE"* ]]
+  [[ "$output" == *"not fully configured"* ]]
 }
 
-@test "empty PATHS array causes error" {
+@test "empty PATHS array is shown in config" {
   cat > "$TEST_CONFIG_DIR/jobs.d/empty.conf" <<EOF
 REPO_NAME="empty"
 PATHS=()
@@ -131,16 +132,35 @@ EOF
   chmod 0640 "$TEST_CONFIG_DIR/jobs.d/empty.conf"
 
   run "$BACKUP_RESTIC_SCRIPT" config empty
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"PATHS is empty"* ]]
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PATHS"* ]]
+  [[ "$output" == *"not fully configured"* ]]
 }
 
-@test "relative repo path triggers warning" {
-  create_job "test" 'REPO="relative/path"'
+@test "run rejects job with missing password file" {
+  cat > "$TEST_CONFIG_DIR/backup-restic.conf" <<EOF
+LOG_DIR="$TEST_LOG_DIR"
+DEFAULT_REPO_BASE="$TEST_CONFIG_DIR/repos"
+EOF
+  chmod 0640 "$TEST_CONFIG_DIR/backup-restic.conf"
 
-  run "$BACKUP_RESTIC_SCRIPT" config test 2>&1
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"WARNING"*"relative path"* ]]
+  create_job "test"
+
+  run "$BACKUP_RESTIC_SCRIPT" run test
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not fully configured"* ]]
+}
+
+@test "run rejects job with empty PATHS" {
+  cat > "$TEST_CONFIG_DIR/jobs.d/empty.conf" <<EOF
+REPO_NAME="empty"
+PATHS=()
+EOF
+  chmod 0640 "$TEST_CONFIG_DIR/jobs.d/empty.conf"
+
+  run "$BACKUP_RESTIC_SCRIPT" run empty
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not fully configured"* ]]
 }
 
 @test "--version prints version" {
