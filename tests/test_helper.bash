@@ -40,8 +40,16 @@ EOF
   # Create the repos base dir
   mkdir -p "$TEST_CONFIG_DIR/repos"
 
-  # Tell backup-restic to use our test config dir
-  export BACKUP_RESTIC_CONFIG_DIR="$TEST_CONFIG_DIR"
+  # Copy the script INTO the test config directory.
+  # The script resolves its config location via readlink -f "$0",
+  # so placing it here makes SCRIPT_DIR (and therefore CONFIG_DIR)
+  # naturally resolve to $TEST_CONFIG_DIR. This works identically
+  # for root and non-root, with no env-var override needed.
+  SCRIPT_SRC="$(cd "$(dirname "$BATS_TEST_DIRNAME")" && pwd)/backup-restic"
+  cp "$SCRIPT_SRC" "$TEST_CONFIG_DIR/backup-restic"
+  chmod 0755 "$TEST_CONFIG_DIR/backup-restic"
+  export BACKUP_RESTIC_SCRIPT="$TEST_CONFIG_DIR/backup-restic"
+
   export PATH="$TEST_BIN_DIR:$PATH"
 
   # Export test paths for use in assertions
@@ -52,10 +60,6 @@ EOF
 
   # Install mock curl (for notification tests)
   install_mock_curl
-
-  # Locate the backup-restic script (assumes tests/ is at repo root)
-  SCRIPT_DIR="$(cd "$(dirname "$BATS_TEST_DIRNAME")" && pwd)"
-  export BACKUP_RESTIC_SCRIPT="$SCRIPT_DIR/backup-restic"
 
   # Never let a test block on terminal input: when bats is run from an
   # interactive terminal it passes that TTY through as stdin, which would
